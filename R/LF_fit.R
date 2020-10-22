@@ -56,8 +56,8 @@ LF_fit <- R6Class(
 
       # fit scaled task for bounded continuous
       learner_task <- tmle_task$get_regression_task(outcome_node,
-        scale = TRUE, drop_censored = TRUE,
-        is_time_variant = self$is_time_variant
+                                                    scale = TRUE, drop_censored = TRUE,
+                                                    is_time_variant = self$is_time_variant
       )
       learner_fit <- delayed_learner_train(self$learner, learner_task)
       return(learner_fit)
@@ -148,7 +148,7 @@ LF_fit <- R6Class(
               return(likelihood)
             }
             samples <- AR.Sim(n_samples, f_X,
-              xlim = c(min(learner$training_task$Y), max(learner$training_task$Y))
+                              xlim = c(min(learner$training_task$Y), max(learner$training_task$Y))
             )
             values[, i] <- samples
           }

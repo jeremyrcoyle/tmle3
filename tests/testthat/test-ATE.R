@@ -6,7 +6,7 @@ library(uuid)
 library(assertthat)
 library(data.table)
 library(future)
-
+options(warn=1)
 # setup data for test
 data(cpp)
 data <- as.data.table(cpp)
@@ -14,6 +14,7 @@ data$parity01 <- as.numeric(data$parity > 0)
 data$parity01_fac <- factor(data$parity01)
 data$haz01 <- as.numeric(data$haz > 0)
 data[is.na(data)] <- 0
+
 node_list <- list(
   W = c("sexn"),
   A = "parity01",
@@ -52,7 +53,7 @@ tmle_task2$uuid
 # estimate likelihood
 initial_likelihood <- tmle_spec$make_initial_likelihood(tmle_task, learner_list)
 
-updater <- tmle3_Update$new(cvtmle = FALSE, convergence_type = "sample_size")
+updater <- tmle3_Update$new(cvtmle = FALSE, convergence_type = "scaled_var")
 targeted_likelihood <- Targeted_Likelihood$new(initial_likelihood, updater)
 
 # define parameter
@@ -72,7 +73,6 @@ tmle_fit <- fit_tmle3(
   tmle_task, targeted_likelihood, list(ate), updater,
   max_it
 )
-
 
 # extract results
 tmle3_psi <- tmle_fit$summary$tmle_est

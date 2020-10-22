@@ -51,12 +51,13 @@ tmle3_Update <- R6Class(
   public = list(
     # TODO: change maxit for test
     initialize = function(maxit = 100, cvtmle = TRUE, one_dimensional = FALSE,
-                              constrain_step = FALSE, delta_epsilon = 1e-4,
-                              convergence_type = c("scaled_var", "sample_size"),
-                              fluctuation_type = c("standard", "weighted"),
-                              optim_delta_epsilon = TRUE,
-                              use_best = FALSE,
-                              verbose = FALSE) {
+                          constrain_step = FALSE, delta_epsilon = 1e-4,
+                          convergence_type = c("scaled_var", "sample_size"),
+                          fluctuation_type = c("standard", "weighted"),
+                          optim_delta_epsilon = TRUE,
+                          use_best = FALSE,
+                          bounds = 0.005,
+                          verbose = FALSE) {
       private$.maxit <- maxit
       private$.cvtmle <- cvtmle
       private$.one_dimensional <- one_dimensional
@@ -66,10 +67,13 @@ tmle3_Update <- R6Class(
       private$.fluctuation_type <- match.arg(fluctuation_type)
       private$.optim_delta_epsilon <- optim_delta_epsilon
       private$.use_best <- use_best
+      private$.bounds <- bounds
       private$.verbose <- verbose
     },
     collapse_covariates = function(estimates, clever_covariates) {
+
       ED <- ED_from_estimates(estimates)
+
       EDnormed <- ED / norm(ED, type = "2")
       collapsed_covariate <- clever_covariates %*% EDnormed
 
@@ -90,7 +94,8 @@ tmle3_Update <- R6Class(
         submodel_data <- self$generate_submodel_data(
           likelihood, tmle_task,
           fold_number, update_node,
-          drop_censored = TRUE
+          drop_censored = TRUE,
+          for_fitting = TRUE
         )
 
         new_epsilon <- self$fit_submodel(submodel_data)
@@ -110,28 +115,47 @@ tmle3_Update <- R6Class(
       private$.step_number <- current_step
     },
     generate_submodel_data = function(likelihood, tmle_task,
-                                          fold_number = "full",
-                                          update_node = "Y",
-                                          drop_censored = FALSE) {
+                                      fold_number = "full",
+                                      update_node = "Y",
+                                      drop_censored = FALSE, for_fitting = FALSE) {
 
+
+      if(!(inherits(likelihood, "Targeted_Likelihood"))) {
+        submodel_type <- "logistic"
+      } else {
+        submodel_type <- likelihood$submodel_type(update_node)
+      }
+
+      submodel_info <- submodel_spec(submodel_type)
       # TODO: change clever covariates to allow only calculating some nodes
       clever_covariates <- lapply(self$tmle_params, function(tmle_param) {
-        tmle_param$clever_covariates(tmle_task, fold_number)
+        # Assert that it supports the submodel type
+        tmle_param$supports_submodel_type(submodel_type, update_node)
+        args <- list(for_fitting = for_fitting, submodel_type = submodel_type, fold_number = fold_number, tmle_task = tmle_task
+                     ,node = update_node)
+        return(suppressWarnings(sl3:::call_with_args(tmle_param$clever_covariates, args)))
+
       })
 
-      node_covariates <- lapply(clever_covariates, `[[`, update_node)
-      covariates_dt <- do.call(cbind, node_covariates)
 
-      if (self$one_dimensional) {
-        observed_task <- likelihood$training_task
-        covariates_dt <- self$collapse_covariates(self$current_estimates, covariates_dt)
+      node_covariates <- lapply(clever_covariates, `[[`, update_node)
+
+      # Get EDs if present. Only for training task
+      if(self$one_dimensional & for_fitting) {
+        IC <- lapply(clever_covariates, `[[`, "IC")
+        IC <- do.call(cbind, lapply(IC, `[[`, update_node) )
+        if(is.null(IC)) {
+          IC <- lapply(private$.current_estimates, `[[`, "IC")
+          IC <- do.call(cbind, IC)
+        }
       }
+
+      covariates_dt <- do.call(cbind, node_covariates)
 
       observed <- tmle_task$get_tmle_node(update_node)
       initial <- likelihood$get_likelihood(
         tmle_task, update_node,
-        fold_number
-      )
+        fold_number)
 
       # scale observed and predicted values for bounded continuous
       observed <- tmle_task$scale(observed, update_node)
@@ -139,66 +163,181 @@ tmle3_Update <- R6Class(
 
 
       # protect against qlogis(1)=Inf
-      initial <- bound(initial, 0.005)
+      initial <- bound(initial, private$.bounds)
+      weights <- tmle_task$get_regression_task(update_node)$weights
+      n <- length(unique(tmle_task$id))
+      if(self$one_dimensional & for_fitting){
+        # This computes (possibly weighted) ED and handles long case
+        ED <- colMeans(IC * weights)
+      } else {
+        ED <- NULL
+      }
+      unequal = F
+      len <- length(observed)
+      if(length(observed) != length(initial)) {
+        unequal = T
+        ratio <- length(initial) / length(observed)
+        if(ratio%%1 == 0){
+          warning("Observed and initial length do not match but are multiples of each other. Recycling values...")
+          observed <- rep(observed, ratio)
+        }
+      }
+
+      if(length(weights) != length(initial)) {
+        ratio <- length(initial) / length(weights)
+        if(ratio%%1 == 0){
+          # This is for likelihood factors that output long_format predictions that dont match nrow of input task
+          warning("Weights and initial length do not match but are multiples of each other. Recycling values...")
+          weights <- rep(weights, ratio)
+        }
+      }
 
       submodel_data <- list(
         observed = observed,
         H = covariates_dt,
-        initial = initial
+        initial = initial,
+        submodel_info = submodel_info,
+        ED = ED,
+        update_node = update_node,
+        weights = weights
       )
+
 
 
       if (drop_censored) {
         censoring_node <- tmle_task$npsem[[update_node]]$censoring_node$name
+        subset <- 1:len
         if (!is.null(censoring_node)) {
           observed_node <- tmle_task$get_tmle_node(censoring_node)
           subset <- which(observed_node == 1)
-          submodel_data <- list(
-            observed = submodel_data$observed[subset],
-            H = submodel_data$H[subset, , drop = FALSE],
-            initial = submodel_data$initial[subset]
-          )
         }
+
+
+        if(unequal) {
+          subset <- 1:len %in% subset
+          ratio <- ratio
+          if(ratio%%1 == 0){
+            subset <- rep(subset, ratio)
+          }
+          subset <- which(subset)
+        }
+
+        submodel_data <- list(
+          observed = submodel_data$observed[subset],
+          H = submodel_data$H[subset, , drop = FALSE],
+          initial = submodel_data$initial[subset],
+          submodel_info = submodel_info,
+          ED = ED,
+          update_node = update_node,
+          weights = submodel_data$weights[subset]
+        )
       }
 
       return(submodel_data)
     },
     fit_submodel = function(submodel_data) {
+      update_node <- submodel_data$update_node
+      submodel_data["update_node"] <- NULL
+      weights <- submodel_data$weights
+      # TODO
+
+      if(self$one_dimensional){
+        # Will break if not called by original training task
+
+        if(is.null(submodel_data$ED)) {
+          #warning("No ED given in clever covariates. Defaulting to full EIC ED, which is incorrect.")
+          submodel_data$H <- self$collapse_covariates(self$current_estimates, submodel_data$H)
+          ED <- ED_from_estimates(self$current_estimates)
+          EDnormed <- ED / (norm(ED, type = "2") )
+          ED <- EDnormed
+
+
+        } else {
+          ED <- submodel_data$ED
+          initial_variances <- private$.initial_variances
+
+          vars <- unlist(lapply(initial_variances, `[[`, update_node))
+          if(self$convergence_type == "scaled_var" & !is.null(vars)){
+            #max_var <- max(vars)
+            #Ensure that params with very small variances dont get too much weight
+            median_var <- median(vars)
+            min_var_allowed <- max(median_var/100,1e-3)
+            zero <- vars < min_var_allowed
+            vars[zero] <- min_var_allowed
+            ED <- ED / sqrt(vars)
+          }
+
+          EDnormed <- ED / norm(ED, type = "2")# / sqrt(length(ED))))
+          submodel_data$H <- submodel_data$H %*% EDnormed
+
+          ED <- EDnormed
+
+
+        }
+      }
+
+      submodel_data["ED"] <- NULL
+      submodel_info <- submodel_data$submodel_info
+      sub_index <- which(names(submodel_data) == "submodel_info")
+
       if (self$constrain_step) {
         ncol_H <- ncol(submodel_data$H)
         if (!(is.null(ncol_H) || (ncol_H == 1))) {
           stop(
             "Updater detected `constrain_step=TRUE` but multi-epsilon submodel.\n",
-            "Consider setting `collapse_covariates=TRUE`"
+            "Consider setting `one_dimensional=TRUE`"
           )
         }
 
 
         risk <- function(epsilon) {
+
           submodel_estimate <- self$apply_submodel(submodel_data, epsilon)
-          loss <- self$loss_function(submodel_estimate, submodel_data$observed)
+
+          loss_function <- submodel_info$loss_function
+
+          loss <- loss_function(submodel_estimate, submodel_data$observed) * weights
           mean(loss)
+
         }
 
 
         if (self$optim_delta_epsilon) {
+          delta_epsilon <- self$delta_epsilon
+          if(is.list(delta_epsilon)) {
+            delta_epsilon <- delta_epsilon[[update_node]]
+          }
+          if(is.function(delta_epsilon)) {
+            delta_epsilon <- delta_epsilon(submodel_data$H)
+          }
+          delta_epsilon <- c(0,delta_epsilon)
+
+          min_eps = min(delta_epsilon)
+          max_eps = max(delta_epsilon)
+
           optim_fit <- optim(
-            par = list(epsilon = self$delta_epsilon), fn = risk,
-            lower = 0, upper = self$delta_epsilon,
+            par = list(epsilon = max_eps), fn = risk,
+            lower = min_eps, upper = max_eps,
             method = "Brent"
           )
           epsilon <- optim_fit$par
+
         } else {
           epsilon <- self$delta_epsilon
+          if(is.list(epsilon)) {
+            epsilon <- epsilon[[update_node]]
+          }
         }
 
         risk_val <- risk(epsilon)
         risk_zero <- risk(0)
 
-        # # TODO: consider if we should do this
-        # if(risk_zero<risk_val){
-        #   epsilon <- 0
-        # }
+        #TODO: consider if we should do this
+        if(risk_zero<=risk_val){
+
+          epsilon <- 0
+          #private$.delta_epsilon <- private$.delta_epsilon/2
+        }
 
         if (self$verbose) {
           cat(sprintf("risk_change: %e ", risk_val - risk_zero))
@@ -206,20 +345,22 @@ tmle3_Update <- R6Class(
       } else {
         if (self$fluctuation_type == "standard") {
           suppressWarnings({
-            submodel_fit <- glm(observed ~ H - 1, submodel_data,
-              offset = qlogis(submodel_data$initial),
-              family = binomial(),
-              start = rep(0, ncol(submodel_data$H))
+            submodel_fit <- glm(observed ~ H - 1, submodel_data[-sub_index],
+                                offset = submodel_info$offset_tranform(submodel_data$initial),
+                                family = submodel_info$family,
+                                weights = weights,
+
+                                start = rep(0, ncol(submodel_data$H))
             )
           })
         } else if (self$fluctuation_type == "weighted") {
           if (self$one_dimensional) {
             suppressWarnings({
-              submodel_fit <- glm(observed ~ -1, submodel_data,
-                offset = qlogis(submodel_data$initial),
-                family = binomial(),
-                weights = as.numeric(H),
-                start = rep(0, ncol(submodel_data$H))
+              submodel_fit <- glm(observed ~ -1, submodel_data[-sub_index],
+                                  offset =  submodel_info$offset_tranform(submodel_data$initial),
+                                  family = submodel_info$family,
+                                  weights = as.numeric(H) * weights,
+                                  start = rep(0, ncol(submodel_data$H))
               )
             })
           } else {
@@ -228,10 +369,11 @@ tmle3_Update <- R6Class(
               "This is incompatible. Proceeding with `fluctuation_type='standard'`."
             )
             suppressWarnings({
-              submodel_fit <- glm(observed ~ H - 1, submodel_data,
-                offset = qlogis(submodel_data$initial),
-                family = binomial(),
-                start = rep(0, ncol(submodel_data$H))
+              submodel_fit <- glm(observed ~ H - 1, submodel_data[-sub_index],
+                                  offset =  submodel_info$offset_tranform(submodel_data$initial),
+                                  family = submodel_info$family,
+                                  weights = weights,
+                                  start = rep(0, ncol(submodel_data$H))
               )
             })
           }
@@ -248,6 +390,10 @@ tmle3_Update <- R6Class(
         cat(sprintf("(max) epsilon: %e ", max_eps))
       }
 
+      if(self$one_dimensional){
+
+        epsilon <- epsilon * ED
+      }
       return(epsilon)
     },
     submodel = function(epsilon, initial, H) {
@@ -257,7 +403,7 @@ tmle3_Update <- R6Class(
       -1 * ifelse(observed == 1, log(estimate), log(1 - estimate))
     },
     apply_submodel = function(submodel_data, epsilon) {
-      self$submodel(epsilon, submodel_data$initial, submodel_data$H)
+      submodel_data$submodel_info$submodel(epsilon, submodel_data$initial, submodel_data$H)
     },
     apply_update = function(tmle_task, likelihood, fold_number, new_epsilon, update_node) {
 
@@ -286,19 +432,32 @@ tmle3_Update <- R6Class(
       estimates <- self$current_estimates
 
       n <- length(unique(tmle_task$id))
+      weights <- tmle_task$weights[!duplicated(tmle_task$id)]
+
+      IC <- do.call(cbind, lapply(estimates, `[[`, "IC"))
+      IC <- IC*weights
       if (self$convergence_type == "scaled_var") {
         # NOTE: the point of this criterion is to avoid targeting in an overly
         #       aggressive manner, as we simply need check that the following
         #       condition is met |P_n D*| / SE(D*) =< max(1/log(n), 1/10)
-        IC <- do.call(cbind, lapply(estimates, `[[`, "IC"))
-        se_Dstar <- sqrt(apply(IC, 2, var) / n)
-        ED_threshold <- se_Dstar / min(log(n), 10)
+        # TODO Use variance from first iteration as weights so criterion does not change
+        # TODO colVars is wrong when using long format
+        # TODO The below is a correction that should be correct for survival (assuming long format is stacked by vectors of time and not by person)
+
+        se_Dstar <- sqrt(apply(IC, 2, function(v) {
+          v <- rowSums(matrix(v, nrow = n))
+          return(var(v))
+        })/n)
+        # Handle case where variance is 0 or very small for whatever reason
+        ED_threshold <- pmax(se_Dstar / min(log(n), 10), 1/n)
+
       } else if (self$convergence_type == "sample_size") {
         ED_threshold <- 1 / n
       }
 
       # get |P_n D*| of any number of parameter estimates
-      ED <- ED_from_estimates(estimates)
+      #ED <- ED_from_estimates(estimates)
+      ED <- apply(IC, 2, mean)
       # zero out any that are from nontargeted parameter components
       ED <- ED * private$.targeted_components
       current_step <- self$step_number
@@ -332,6 +491,53 @@ tmle3_Update <- R6Class(
       private$.current_estimates <- lapply(self$tmle_params, function(tmle_param) {
         tmle_param$estimates(tmle_task, update_fold)
       })
+
+      # Initial variances to use for one_dimensional when scaled_var method used
+      #TODO check
+      if(self$convergence_type == "scaled_var") {
+        #TODO weights correctly
+        clever_covariates <- lapply(self$tmle_params, function(tmle_param) {
+          args <- list(tmle_task = tmle_task, update_fold = update_fold, for_fitting = T)
+          return(suppressWarnings(sl3:::call_with_args(tmle_param$clever_covariates, args)))
+        })
+        weights <- tmle_task$weights[!duplicated(tmle_task$id)]
+        IC <- lapply(clever_covariates, `[[`, "IC")
+
+        if(!is.null(IC[[1]])){
+          n <- length(unique(tmle_task$id))
+          IC_vars <- lapply(IC, function(IC) {
+
+            out <- lapply(self$update_nodes, function(node) {
+              IC_node <- IC[[node]]
+              IC_node <- as.matrix(IC_node)
+              IC_node <- IC_node * weights
+              as.vector(apply(IC_node ,2, var ))})
+            names(out) <- self$update_nodes
+            return(out)
+          })
+          private$.initial_variances <- IC_vars
+
+
+        } else {
+
+          n <- length(unique(tmle_task$id))
+          weights <- tmle_task$weights[!duplicated(tmle_task$id)]
+
+          IC <- lapply(private$.current_estimates, `[[`, "IC")
+          IC_vars <- lapply(IC, function(IC) {
+            IC <- as.matrix(IC)
+            IC <- IC * weights
+            IC_var <- apply(IC, 2, var)
+            IC_var <- lapply(self$update_nodes, function(node) {IC_var})
+            names(IC_var) <- self$update_nodes
+            return(IC_var)
+          })
+          private$.initial_variances <- IC_vars
+        }
+      }
+
+
+      #private$.initial_variances <- lapply(private$.current_estimates, `[[`, "var_comps")
 
       for (steps in seq_len(maxit)) {
         self$update_step(likelihood, tmle_task, update_fold)
@@ -435,6 +641,9 @@ tmle3_Update <- R6Class(
     },
     current_estimates = function() {
       return(private$.current_estimates)
+    },
+    initial_variances = function(){
+      return(private$.initial_variances)
     }
   ),
   private = list(
@@ -456,6 +665,8 @@ tmle3_Update <- R6Class(
     .use_best = NULL,
     .verbose = FALSE,
     .targeted_components = NULL,
-    .current_estimates = NULL
+    .current_estimates = NULL,
+    .initial_variances = NULL,
+    .bounds = NULL
   )
 )

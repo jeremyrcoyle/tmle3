@@ -42,14 +42,35 @@ Param_base <- R6Class(
         stop("Invalid Likelihood class: ", class(observed_likelihood))
       }
     },
-    clever_covariates = function(tmle_task = NULL, fold_number = "full") {
+    clever_covariates = function(tmle_task = NULL, fold_number = "full", submodel_type = "logistic") {
+      # TODO Returns clever covariates and component-specific ICs ?
       stop("Param_base is a base class")
     },
     estimates = function(tmle_task = NULL, fold_number = "full") {
+      #Returns full IC and estimate
       stop("Param_base is a base class")
+    },
+    empirical_mean = function(tmle_task, observed, baseline_node = "W") {
+      if(is.null(tmle_task)) {
+        tmle_task <- self$observed_likelihood$training_task
+      }
+      self$observed_likelihood$factor_list[[baseline_node]]$empirical_mean(tmle_task, observed)
     },
     print = function() {
       cat(sprintf("%s: %s\n", class(self)[1], self$name))
+    },
+    supports_submodel_type = function(submodel_type, node){
+
+      if(is.list(self$submodel_type_supported)) {
+        if( !is.null(self$submodel_type_supported[[node]]) & self$submodel_type_supported[[node]]!=submodel_type) {
+          stop(sprintf("This Param does not support the optimization strategy: %s", submodel_type))
+
+        }
+      }
+      else if(!(submodel_type %in% self$submodel_type_supported)){
+        stop(sprintf("This Param does not support the optimization strategy: %s", submodel_type))
+      }
+
     }
   ),
   active = list(
@@ -69,16 +90,24 @@ Param_base <- R6Class(
     supports_outcome_censoring = function() {
       return(private$.supports_outcome_censoring)
     },
+    supports_weights = function() {
+      return(TRUE)
+    },
     targeted = function() {
       return(private$.targeted)
-    }
+    },
+  submodel_type_supported = function() {
+    return(private$.submodel_type_supported)
+  }
   ),
   private = list(
     .type = "undefined",
     .observed_likelihood = NULL,
     .outcome_node = NULL,
     .targeted = TRUE,
-    .supports_outcome_censoring = FALSE
+    .supports_outcome_censoring = FALSE,
+    .submodel_type_supported = c("logistic"),
+    .supports_weights = T
   )
 )
 

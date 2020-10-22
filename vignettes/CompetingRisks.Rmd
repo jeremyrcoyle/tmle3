@@ -1,0 +1,262 @@
+---
+title: "competingRisks"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+devtools::document()
+```
+
+```{r}
+whichK(c(1,1,2))
+```
+
+
+```{r}
+
+whichK <- function(...){
+  mat <- setDT(list(...))
+
+  best <- as.vector(apply(mat, 1, which.min)) 
+  as.numeric(best) - 1
+}
+
+
+library(simcausal)
+D <- DAG.empty()
+D <- D +
+  node("W1", distr = "rbinom", size = 15, prob = rep(1/15,15)) +
+  node("W", distr = "rconst", const = W1 + 1) +
+  node("A", distr = "rbinom", size = 1, prob = .15 + .5 * as.numeric(W >7)) +
+  node("Trexp1", distr = "rexp", rate =   min(abs(1 + 0.5*W*A + W - A), 8)) +
+  node("Trexp2", distr = "rexp", rate = min(abs(1 + 0.5*W*A + W - A), 8)) +
+  node("Cweib", distr = "rexp",  rate =   min(abs(1 + 0.5*W*A + W - A), 8)) +
+  node("noise1", distr = "runif", min = 0, max = 3) +
+   node("noise2", distr = "runif", min = 0, max = 3) +
+   node("noise3", distr = "runif", min = 0, max = 3) +
+
+  node("T1", distr = "rconst", const = min(ceiling(Trexp1 * 5 + noise1 ),8)) +
+    node("T2", distr = "rconst", const = min(ceiling(Trexp1 * 5 + noise2 ),8)) +
+  node("C", distr = "rconst", const = ceiling(Cweib * 15 + noise3)) +
+  # Observed random variable (follow-up time):
+  node("T.tilde", distr = "rconst", const = pmin(C,T1,T2)) + 
+   node("Delta", distr = "rconst", const = whichK(C,T1,T2))
+setD <- set.DAG(D, vecfun = c("pmin", "whichK"))
+dat <- sim(setD, n = 2000)
+dat
+# only grab ID, W's, A, T.tilde, Delta
+Wname <- grep("W", colnames(dat), value = TRUE)
+dat
+dat <- dat[, c("ID", Wname, "A", "T.tilde", "Delta")]
+dat
+dat$id <- dat$ID
+dat$ID <- NULL
+table(dat$Delta)
+dat$processN1 <- as.numeric(dat$Delta == 1)
+dat$processN2 <- as.numeric(dat$Delta == 2)
+
+dat$processA <- as.numeric(dat$Delta == 0)
+dat$t <- dat$T.tilde
+dat$T.tilde <- NULL
+
+init_dat = copy(dat)
+init_dat$t = 0
+init_dat$processN1 <- 0
+init_dat$processN2 <- 0
+
+init_dat$processA <- 0
+long_data <- data.table(rbind(init_dat, dat))
+setkey(long_data, id, t)
+long_data
+```
+
+
+```{r}
+table(long_data$Delta)
+table(long_data$t[long_data$Delta==1])
+```
+
+
+```{r}
+ times <- 1:max(long_data$t)
+  baseline_covariates <- c("W")
+  baseline_treatments <- c("A")
+  censoring_node <- "processA"
+  risk_nodes <- c("processN1", "processN2")
+
+make_competing_risk_npsem <- function(baseline_covariates,baseline_treatments, censoring_node, risk_nodes, times ) {
+  
+  # competing_risks_indicator <- function(data, time, args) {
+  #   all_risks <- setdiff(colnames(data), "t")
+  #   parents <- args$parents
+  #   past_jump <- all(unlist(data[data$t<time, last(.SD), .SDcols = ..all_risks]) == 0)
+  #   if(length(parents) > 0){
+  #     cur_jump <- all(unlist(data[data$t<=time, last(.SD), .SDcols = ..parents]) == 0)
+  #   } else {
+  #     cur_jump <- T
+  #   }
+  #   return(as.numeric(cur_jump & past_jump))
+  # }
+  
+  competing_risks_indicator <- function(data, time, args, cols) {
+    all_risks <- setdiff(cols, "t")
+    parents <- args$parents
+   
+
+    past_jump_id <- data[t<time, last(.SD), .SDcols = all_risks, by = id]
+   
+    past_jump_id <- past_jump_id$id[rowSums(past_jump_id[, ..all_risks]) == 0]
+    if(length(parents) > 0){
+      cur_jump_id <- data[id %in% past_jump_id, last(.SD), .SDcols = parents, by = id]
+      cur_jump_id <- cur_jump_id$id[rowSums(cur_jump_id[, ..parents]) == 0]
+    } else {
+      cur_jump_id <- past_jump_id
+    }
+    set(data, , "keep", as.numeric(data$id %in% cur_jump_id) )
+    return(data[, c("id", "keep")])
+  }
+
+ 
+  npsem <- list()
+  
+  npsem[["W"]] <- define_node("W", baseline_covariates, time = 0)
+  for(node in baseline_treatments){
+    npsem[[node]] <- define_node(node, node, "W", time = 0)
+  }
+  risk_set_map <- Summary_measure$new(c(censoring_node, risk_nodes, "t"), competing_risks_indicator, args_to_pass = list(parents = risk_nodes), group_by_id = F)
+  npsem[[censoring_node]] <-  define_node(censoring_node, censoring_node, c("W", baseline_treatments), time = times, risk_set_map = risk_set_map, missing_row_implies_not_at_risk = F)
+  for(i in seq_along(risk_nodes)){
+    node <- risk_nodes[[i]]
+    nodeName <- node
+    if(i != 1){
+      nodeName <- paste0(node, "_quasi")
+    } 
+    risk_set_map <- Summary_measure$new(c(censoring_node, risk_nodes, "t"), competing_risks_indicator, args_to_pass = list(parents = risk_nodes[risk_nodes<node]), group_by_id = F)
+    npsem[[nodeName]] <- define_node(nodeName, node, c(baseline_covariates, baseline_treatments), time = times, risk_set_map = risk_set_map, missing_row_implies_not_at_risk = F)
+  }
+  
+  for(i in seq_along(risk_nodes)){
+    if(i==1) next
+    node <- risk_nodes[[i]]
+    nodeName <- node
+    
+    risk_set_map <- Summary_measure$new(c(censoring_node, risk_nodes, "t"), competing_risks_indicator, args_to_pass = list(parents = c()), group_by_id = F)
+    npsem[[nodeName]] <- define_node(nodeName, node, c(baseline_covariates, baseline_treatments), time = times, risk_set_map = risk_set_map, missing_row_implies_not_at_risk = F)
+  }
+  return(npsem)
+}
+
+  npsem <- make_competing_risk_npsem(baseline_covariates,baseline_treatments, censoring_node, risk_nodes, times)
+```
+
+```{r}
+make_competing_risk_likelihood <- function(baseline_node, trtment_nodes, censoring_node, competing_risk_nodes, trt_learner = make_learner(Lrnr_glm), competing_risks_learner = make_learner(Lrnr_glm), censoring_learner = make_learner(Lrnr_glm)){
+  factor_list <- list()
+  factor_list[[baseline_node]] <- LF_emp$new(baseline_node)
+  for(node in trtment_nodes){
+    factor_list[[node]] <- LF_fit$new(node, trt_learner)
+  }
+  for(node in competing_risk_nodes){
+    factor_list[[node]] <- LF_fit$new(node, competing_risks_learner, is_time_variant = T, type = "mean")
+  }
+  factor_list[[censoring_node]]  <- LF_fit$new(censoring_node, censoring_learner, is_time_variant = T, type = "mean")
+  return(Likelihood$new(factor_list))
+}
+
+likelihood <- make_competing_risk_likelihood("W", "A", "processA", c("processN1", "processN2_quasi"))
+```
+
+
+
+```{r}
+task <- tmle3_Task$new(long_data, npsem,  t="t",id = "id")
+likelihood <- likelihood$train(task)
+```
+
+
+```{r}
+risk_nodes
+quasi_nodes <- grep("quasi", names(likelihood$factor_list), value = T)
+added_factors <-  list()
+for(quasi in quasi_nodes) {
+  node <- stringr::str_remove(quasi, "_quasi")
+  parents <- risk_nodes[risk_nodes < node]
+  added_factors[[node]] <- LF_binomial_collapsed$new(node, likelihood$factor_list, parents, quasi, type = "mean")
+}
+
+likelihood$add_factors(added_factors)
+
+```
+
+```{r}
+apply(est$EIC, 2, quantile)
+
+
+```
+```{r}
+task$force_at_risk <- T
+
+tlikelihood <- Targeted_Likelihood$new(likelihood, updater = list(one_dimensional = T, constrain_step = T, delta_epsilon = 0.0005, optim_delta_epsilon = T, convergence_type = "scaled_var"))
+param = Param_CR$new(tlikelihood, list("A" = LF_static$new("A", value = 1)), competing_risk_nodes = c("processN2"), target_risk_node = "processN1", marginalized = T, target_times = 1:5)
+
+param2 = Param_CR$new(tlikelihood, list("A" = LF_static$new("A", value = 1)), competing_risk_nodes = c("processN2_quasi"), target_risk_node = "processN1", marginalized = F, target_times = 1:5, node_time_ordering = c("processN1", "processN2_quasi"))
+
+param$estimates(task)$psi
+param2$estimates(task)$psi
+```
+
+
+
+
+```{r}
+clev = param$clever_covariates(task)
+a=clev$ED$processN1/sqrt(est$var_comps$processN1)
+b=clev$ED$processN2/max(sqrt(est$var_comps$processN1),1e-4)
+a
+b
+norm(a, type = "2")
+norm(b, type = "2")
+a=clev$ED$processN1
+b=clev$ED$processN2
+a
+b
+norm(a, type = "2")
+norm(b, type = "2")
+tlikelihood$updater$update_step(tlikelihood, task)
+clev = param$clever_covariates(task)
+a=clev$ED$processN1/sqrt(est$var_comps$processN1)
+b=clev$ED$processN2/max(sqrt(est$var_comps$processN1),1e-4)
+a
+b
+norm(a, type = "2")
+norm(b, type = "2")
+a=clev$ED$processN1
+b=clev$ED$processN2
+a
+b
+norm(a, type = "2")
+norm(b, type = "2")
+
+```
+
+```{r}
+est <- param$estimates(task)
+library(ggplot2)
+ggplot(data.frame(psi = est$psi, t = seq_along(est$psi)), aes(x = t, y = psi))  + geom_point() + geom_smooth(se = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

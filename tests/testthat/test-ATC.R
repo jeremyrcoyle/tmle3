@@ -71,7 +71,8 @@ tmle_fit <- fit_tmle3(
 tmle3_psi <- tmle_fit$summary$tmle_est
 tmle3_se <- tmle_fit$summary$se
 tmle3_epsilon <- updater$epsilons[[1]]$Y
-
+ print(updater$epsilons[[1]]$Y)
+ print(tmle_fit$summary$tmle_est)
 #################################################
 # compare with the tmle package
 library(tmle)
@@ -83,6 +84,7 @@ cf_task1 <- atc$cf_likelihood_treatment$cf_tasks[[1]]
 cf_task0 <- atc$cf_likelihood_control$cf_tasks[[1]]
 
 # get Q
+
 EY1 <- initial_likelihood$get_likelihoods(cf_task1, "Y")
 EY0 <- initial_likelihood$get_likelihoods(cf_task0, "Y")
 EY1_final <- targeted_likelihood$get_likelihoods(cf_task1, "Y")
@@ -90,10 +92,10 @@ EY0_final <- targeted_likelihood$get_likelihoods(cf_task0, "Y")
 
 # EY0 <- rep(0, length(EY1)) # not used
 Q <- cbind(EY0, EY1)
-
+print(head(Q))
 # get G
 pA1 <- initial_likelihood$get_likelihoods(cf_task1, "A")
-
+print(head(pA1))
 # debugonce(oneStepATT)
 tmle_classic_fit <- tmle(
   Y = tmle_task$get_tmle_node("Y"),
